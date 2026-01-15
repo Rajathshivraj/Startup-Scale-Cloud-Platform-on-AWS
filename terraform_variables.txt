@@ -1,0 +1,173 @@
+# ============================================================================
+# Variable Definitions
+# ============================================================================
+# Centralizes all configurable parameters for the infrastructure.
+# Variables enable environment-specific deployments (dev/staging/prod) without
+# code duplication, following DRY (Don't Repeat Yourself) principles.
+#
+# BEST PRACTICE: Use terraform.tfvars files for actual values (not committed)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Region Configuration
+# ----------------------------------------------------------------------------
+variable "aws_region" {
+  description = "AWS region where all resources will be deployed. Consider latency to users and AWS service availability."
+  type        = string
+  default     = "us-east-1"
+  # PRODUCTION TIP: Use multiple regions with Route 53 for disaster recovery
+}
+
+variable "environment" {
+  description = "Environment name (dev, staging, prod) - used for resource naming and tagging"
+  type        = string
+  default     = "dev"
+
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be dev, staging, or prod."
+  }
+}
+
+# ----------------------------------------------------------------------------
+# Network Configuration
+# ----------------------------------------------------------------------------
+variable "vpc_cidr" {
+  description = "CIDR block for VPC. Size determines maximum IP addresses available (65,536 IPs for /16)"
+  type        = string
+  default     = "10.0.0.0/16"
+  # NETWORK DESIGN: /16 provides 65,534 usable hosts, suitable for large-scale deployments
+}
+
+variable "availability_zones" {
+  description = "List of AZs for multi-AZ deployment (minimum 2 for high availability)"
+  type        = list(string)
+  default     = ["us-east-1a", "us-east-1b"]
+  # WHY MULTI-AZ: Protects against datacenter-level failures (99.99% SLA requirement)
+}
+
+variable "public_subnet_cidrs" {
+  description = "CIDR blocks for public subnets (ALB, NAT Gateway). Must be within VPC CIDR."
+  type        = list(string)
+  default     = ["10.0.1.0/24", "10.0.2.0/24"]
+  # SIZE RATIONALE: /24 = 251 usable IPs per subnet, sufficient for load balancers
+}
+
+variable "private_subnet_cidrs" {
+  description = "CIDR blocks for private subnets (ECS tasks, RDS, Lambda). No direct internet access."
+  type        = list(string)
+  default     = ["10.0.10.0/24", "10.0.11.0/24"]
+  # SECURITY PRINCIPLE: Isolate compute/data layers from public internet
+}
+
+# ----------------------------------------------------------------------------
+# ECS Configuration
+# ----------------------------------------------------------------------------
+variable "ecs_task_cpu" {
+  description = "CPU units for ECS task (1024 = 1 vCPU). Fargate supports specific CPU/memory combinations."
+  type        = number
+  default     = 512
+  # COST OPTIMIZATION: 0.5 vCPU suitable for lightweight APIs in dev environment
+}
+
+variable "ecs_task_memory" {
+  description = "Memory in MB for ECS task. Must match Fargate-supported CPU/memory pairs."
+  type        = number
+  default     = 1024
+  # REFERENCE: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-cpu-memory-error.html
+}
+
+variable "ecs_desired_count" {
+  description = "Number of ECS tasks to run. Scale based on traffic patterns and redundancy needs."
+  type        = number
+  default     = 2
+  # RELIABILITY: Minimum 2 tasks across 2 AZs ensures zero-downtime deployments
+}
+
+variable "container_port" {
+  description = "Port exposed by the Docker container (matches Flask app.run(port=))"
+  type        = number
+  default     = 5000
+}
+
+# ----------------------------------------------------------------------------
+# RDS Configuration
+# ----------------------------------------------------------------------------
+variable "db_instance_class" {
+  description = "RDS instance type. Use t3.micro for dev, r6g.xlarge for production workloads."
+  type        = string
+  default     = "db.t3.micro"
+  # COST vs PERFORMANCE: t3.micro = $15/month (dev), r6g.2xlarge = $800/month (prod)
+}
+
+variable "db_name" {
+  description = "Initial database name created in PostgreSQL instance"
+  type        = string
+  default     = "startupdb"
+}
+
+variable "db_username" {
+  description = "Master username for RDS instance (avoid 'admin' or 'root' for security)"
+  type        = string
+  default     = "dbadmin"
+  sensitive   = true # Prevents value from appearing in logs
+}
+
+variable "db_allocated_storage" {
+  description = "Initial storage in GB for RDS instance. Auto-scales if enabled."
+  type        = number
+  default     = 20
+  # STORAGE TYPES: gp3 (general purpose) vs io2 (high IOPS for intensive workloads)
+}
+
+# ----------------------------------------------------------------------------
+# DynamoDB Configuration
+# ----------------------------------------------------------------------------
+variable "dynamodb_table_name" {
+  description = "Name of DynamoDB table for NoSQL data (sessions, user preferences, etc.)"
+  type        = string
+  default     = "startup-data"
+}
+
+variable "dynamodb_billing_mode" {
+  description = "PAY_PER_REQUEST (on-demand) or PROVISIONED (reserved capacity)"
+  type        = string
+  default     = "PAY_PER_REQUEST"
+  # DECISION FACTORS: On-demand best for unpredictable traffic, Provisioned for steady-state
+}
+
+# ----------------------------------------------------------------------------
+# Application Configuration
+# ----------------------------------------------------------------------------
+variable "app_image" {
+  description = "Docker image URI from ECR (format: account-id.dkr.ecr.region.amazonaws.com/repo:tag)"
+  type        = string
+  default     = "nginx:latest" # Placeholder until CI/CD pipeline pushes real image
+  # PRODUCTION: Replace with actual ECR repository URI after terraform apply
+}
+
+variable "health_check_path" {
+  description = "Endpoint for ALB health checks. Must return 200 OK for task to be considered healthy."
+  type        = string
+  default     = "/health"
+}
+
+# ----------------------------------------------------------------------------
+# Monitoring Configuration
+# ----------------------------------------------------------------------------
+variable "alarm_email" {
+  description = "Email address for CloudWatch alarm notifications (SNS subscription)"
+  type        = string
+  default     = "devops@startup.com"
+  # PRODUCTION: Use PagerDuty integration or Slack webhooks for on-call alerting
+}
+
+# ============================================================================
+# INTERVIEW TALKING POINTS:
+# ============================================================================
+# 1. Validation blocks enforce infrastructure policies (prevent typos/misconfigs)
+# 2. Sensitive = true prevents secrets from appearing in terraform plan output
+# 3. Default values enable quick dev deployments while supporting prod overrides
+# 4. Type constraints (string/number/list) catch configuration errors early
+# 5. Descriptive comments serve as living documentation for team members
+# ============================================================================

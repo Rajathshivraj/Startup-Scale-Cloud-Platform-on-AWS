@@ -1,0 +1,270 @@
+# ============================================================================
+# Application Load Balancer (ALB) - Layer 7 Load Balancing
+# ============================================================================
+# The ALB acts as the single entry point for all user traffic, distributing
+# requests across healthy ECS tasks in multiple availability zones.
+#
+# KEY FEATURES:
+# - Path-based routing (send /api/* to one target, /admin/* to another)
+# - Host-based routing (route based on domain name)
+# - SSL/TLS termination
+# - Health checks with automatic failover
+# - Connection draining for graceful shutdowns
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Security Group for ALB - Controls Inbound Traffic
+# ----------------------------------------------------------------------------
+resource "aws_security_group" "alb" {
+  name        = "${var.environment}-alb-sg"
+  description = "Security group for Application Load Balancer"
+  vpc_id      = aws_vpc.main.id
+
+  # INBOUND RULE: Allow HTTP from anywhere
+  ingress {
+    description = "Allow HTTP traffic from internet"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # Public access
+  }
+
+  # PRODUCTION: Add HTTPS rule and remove HTTP
+  # ingress {
+  #   description = "Allow HTTPS traffic from internet"
+  #   from_port   = 443
+  #   to_port     = 443
+  #   protocol    = "tcp"
+  #   cidr_blocks = ["0.0.0.0/0"]
+  # }
+
+  # OUTBOUND RULE: Allow all outbound traffic
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1" # -1 means all protocols
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.environment}-alb-sg"
+  }
+}
+
+# SECURITY CONSIDERATION: ALB is the ONLY resource exposed to internet (0.0.0.0/0)
+# All other resources (ECS, RDS) are in private subnets with restricted access
+
+# ----------------------------------------------------------------------------
+# Application Load Balancer
+# ----------------------------------------------------------------------------
+resource "aws_lb" "main" {
+  name               = "${var.environment}-startup-alb"
+  internal           = false # Internet-facing (not internal VPC-only)
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = aws_subnet.public[*].id # Deploy in public subnets across all AZs
+
+  # Enable deletion protection in production
+  enable_deletion_protection = false # Set to true for prod
+
+  # Store access logs in S3 for compliance/troubleshooting
+  # access_logs {
+  #   bucket  = aws_s3_bucket.alb_logs.bucket
+  #   prefix  = "alb-logs"
+  #   enabled = true
+  # }
+
+  tags = {
+    Name = "${var.environment}-alb"
+  }
+}
+
+# ALB vs NLB vs CLB:
+# - ALB: Layer 7 (HTTP/HTTPS), content-based routing, WebSocket support
+# - NLB: Layer 4 (TCP/UDP), ultra-low latency, static IP addresses
+# - CLB: Legacy, use ALB or NLB instead
+
+# ----------------------------------------------------------------------------
+# Target Group - Defines Health Check and Routing
+# ----------------------------------------------------------------------------
+resource "aws_lb_target_group" "app" {
+  name        = "${var.environment}-app-tg"
+  port        = var.container_port # Must match Docker container EXPOSE port
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip" # For Fargate (use "instance" for EC2-based ECS)
+
+  # HEALTH CHECK CONFIGURATION
+  health_check {
+    enabled             = true
+    path                = var.health_check_path # e.g., /health
+    protocol            = "HTTP"
+    port                = "traffic-port" # Use same port as traffic
+    healthy_threshold   = 2              # Success after 2 consecutive checks
+    unhealthy_threshold = 3              # Fail after 3 consecutive failures
+    timeout             = 5              # Wait 5 seconds for response
+    interval            = 30             # Check every 30 seconds
+    matcher             = "200"          # Expect HTTP 200 OK
+  }
+
+  # DEREGISTRATION DELAY (Connection Draining)
+  deregistration_delay = 30 # Wait 30 seconds before stopping task (graceful shutdown)
+
+  tags = {
+    Name = "${var.environment}-target-group"
+  }
+}
+
+# HEALTH CHECK STRATEGY:
+# - Interval: 30s = balance between quick failure detection and avoiding log spam
+# - Timeout: 5s = reasonable for API responses (increase to 10s for slow endpoints)
+# - Thresholds: 2/3 = achieve high availability without false positives
+
+# ----------------------------------------------------------------------------
+# ALB Listener - Handles Incoming Requests
+# ----------------------------------------------------------------------------
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = "80"
+  protocol          = "HTTP"
+
+  # DEFAULT ACTION: Forward all traffic to target group
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+
+# ADVANCED ROUTING EXAMPLES (For Complex Applications):
+#
+# 1. Redirect HTTP to HTTPS:
+# default_action {
+#   type = "redirect"
+#   redirect {
+#     port        = "443"
+#     protocol    = "HTTPS"
+#     status_code = "HTTP_301"
+#   }
+# }
+#
+# 2. Path-based routing:
+# aws_lb_listener_rule "api" {
+#   listener_arn = aws_lb_listener.https.arn
+#   action {
+#     type             = "forward"
+#     target_group_arn = aws_lb_target_group.api.arn
+#   }
+#   condition {
+#     path_pattern { values = ["/api/*"] }
+#   }
+# }
+#
+# 3. Host-based routing:
+# condition {
+#   host_header { values = ["api.example.com"] }
+# }
+
+# ----------------------------------------------------------------------------
+# HTTPS Listener (Production Setup)
+# ----------------------------------------------------------------------------
+# PRODUCTION REQUIREMENT: Use AWS Certificate Manager (ACM) for SSL/TLS
+# resource "aws_lb_listener" "https" {
+#   load_balancer_arn = aws_lb.main.arn
+#   port              = "443"
+#   protocol          = "HTTPS"
+#   ssl_policy        = "ELBSecurityPolicy-TLS-1-2-2017-01" # Enforce TLS 1.2+
+#   certificate_arn   = aws_acm_certificate.main.arn
+#
+#   default_action {
+#     type             = "forward"
+#     target_group_arn = aws_lb_target_group.app.arn
+#   }
+# }
+
+# SSL/TLS BEST PRACTICES:
+# - Always use TLS 1.2 or higher (1.0/1.1 deprecated)
+# - Terminate SSL at ALB (simplifies container management)
+# - Use ACM for automatic certificate renewal
+
+# ----------------------------------------------------------------------------
+# Security Group for ECS Tasks - Allow Traffic from ALB Only
+# ----------------------------------------------------------------------------
+resource "aws_security_group" "ecs_tasks" {
+  name        = "${var.environment}-ecs-tasks-sg"
+  description = "Security group for ECS tasks (allow ALB traffic only)"
+  vpc_id      = aws_vpc.main.id
+
+  # INBOUND RULE: Accept traffic ONLY from ALB security group
+  ingress {
+    description     = "Allow traffic from ALB"
+    from_port       = var.container_port
+    to_port         = var.container_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id] # Source is ALB SG, not IP range
+  }
+
+  # OUTBOUND RULE: Allow all outbound (for API calls, database connections)
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.environment}-ecs-tasks-sg"
+  }
+}
+
+# SECURITY ARCHITECTURE: Security group chaining
+# Internet → ALB SG (allows 0.0.0.0/0:80) → ECS SG (allows ALB SG:5000)
+# Result: ECS tasks CANNOT be accessed directly from internet
+
+# ============================================================================
+# MONITORING INTEGRATION (Interview Talking Point):
+# ============================================================================
+# ALB automatically publishes metrics to CloudWatch:
+# - RequestCount: Total HTTP requests
+# - TargetResponseTime: Latency from target
+# - HTTPCode_Target_4XX_Count: Client errors
+# - HTTPCode_Target_5XX_Count: Server errors
+# - UnHealthyHostCount: Failing health checks
+# - ActiveConnectionCount: Current connections
+#
+# Set CloudWatch Alarms on:
+# - UnHealthyHostCount > 0 (immediate alert)
+# - HTTPCode_Target_5XX_Count > threshold (application errors)
+# - TargetResponseTime > 1s (performance degradation)
+# ============================================================================
+
+# ============================================================================
+# COST OPTIMIZATION:
+# ============================================================================
+# ALB Pricing (us-east-1):
+# - $0.0225/hour (~$16/month) base cost
+# - $0.008 per LCU-hour (Load Balancer Capacity Unit)
+#   * LCU based on: new connections/sec, active connections, bandwidth, rule evaluations
+#
+# Cost Reduction Strategies:
+# 1. Use single ALB for multiple services (path-based routing)
+# 2. Optimize health check intervals (reduce from 10s to 30s)
+# 3. Consider NLB if you only need TCP load balancing (cheaper)
+# ============================================================================
+
+# OUTPUT: ALB DNS name for accessing the application
+output "alb_dns_name" {
+  description = "DNS name of the Application Load Balancer"
+  value       = aws_lb.main.dns_name
+}
+
+output "alb_zone_id" {
+  description = "Route53 zone ID of ALB (for creating DNS records)"
+  value       = aws_lb.main.zone_id
+}
+
+output "target_group_arn" {
+  description = "ARN of target group (used by ECS service)"
+  value       = aws_lb_target_group.app.arn
+}

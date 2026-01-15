@@ -1,0 +1,272 @@
+# ============================================================================
+# Terraform Outputs - Export Important Values
+# ============================================================================
+# Outputs make critical infrastructure information available after deployment
+# for use in CI/CD pipelines, documentation, or manual operations.
+#
+# WHY OUTPUTS MATTER:
+# - Automatic documentation of deployed resources
+# - Integration with CI/CD (GitHub Actions can read outputs)
+# - Cross-module communication in large Terraform projects
+# - Human-readable summary of deployment
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# VPC and Networking Outputs
+# ----------------------------------------------------------------------------
+output "vpc_id" {
+  description = "ID of the VPC"
+  value       = aws_vpc.main.id
+}
+
+output "public_subnet_ids" {
+  description = "List of public subnet IDs (for ALB)"
+  value       = aws_subnet.public[*].id
+}
+
+output "private_subnet_ids" {
+  description = "List of private subnet IDs (for ECS tasks, RDS)"
+  value       = aws_subnet.private[*].id
+}
+
+# ----------------------------------------------------------------------------
+# Load Balancer Outputs
+# ----------------------------------------------------------------------------
+output "alb_dns_name" {
+  description = "DNS name of Application Load Balancer (use this to access your app)"
+  value       = aws_lb.main.dns_name
+}
+
+output "alb_url" {
+  description = "Full HTTP URL to access the application"
+  value       = "http://${aws_lb.main.dns_name}"
+}
+
+output "alb_arn" {
+  description = "ARN of Application Load Balancer"
+  value       = aws_lb.main.arn
+}
+
+# USAGE: After 'terraform apply', run 'curl http://<alb_dns_name>/health'
+# to verify application is responding
+
+# ----------------------------------------------------------------------------
+# ECS Outputs
+# ----------------------------------------------------------------------------
+output "ecs_cluster_name" {
+  description = "Name of ECS cluster (used by CI/CD for deployments)"
+  value       = aws_ecs_cluster.main.name
+}
+
+output "ecs_service_name" {
+  description = "Name of ECS service (used by CI/CD for task updates)"
+  value       = aws_ecs_service.app.name
+}
+
+output "ecs_task_definition_family" {
+  description = "Family name of ECS task definition"
+  value       = aws_ecs_task_definition.app.family
+}
+
+# CI/CD INTEGRATION: GitHub Actions uses these values to update ECS service
+# aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+
+# ----------------------------------------------------------------------------
+# Database Outputs
+# ----------------------------------------------------------------------------
+output "rds_endpoint" {
+  description = "RDS instance connection endpoint (hostname:port)"
+  value       = aws_db_instance.main.endpoint
+}
+
+output "rds_database_name" {
+  description = "Name of the PostgreSQL database"
+  value       = aws_db_instance.main.db_name
+}
+
+output "rds_instance_id" {
+  description = "RDS instance identifier"
+  value       = aws_db_instance.main.id
+}
+
+# SECURITY NOTE: Never output passwords or sensitive credentials
+# Use AWS Secrets Manager or Parameter Store for sensitive values
+
+# ----------------------------------------------------------------------------
+# DynamoDB Outputs
+# ----------------------------------------------------------------------------
+output "dynamodb_table_name" {
+  description = "Name of DynamoDB table (set as environment variable in ECS)"
+  value       = aws_dynamodb_table.main.name
+}
+
+output "dynamodb_table_arn" {
+  description = "ARN of DynamoDB table (for IAM policies)"
+  value       = aws_dynamodb_table.main.arn
+}
+
+output "dynamodb_stream_arn" {
+  description = "ARN of DynamoDB stream (for Lambda event source mappings)"
+  value       = aws_dynamodb_table.main.stream_arn
+}
+
+# ----------------------------------------------------------------------------
+# IAM Role Outputs
+# ----------------------------------------------------------------------------
+output "ecs_task_role_arn" {
+  description = "ARN of ECS task role (application permissions)"
+  value       = aws_iam_role.ecs_task_role.arn
+}
+
+output "ecs_execution_role_arn" {
+  description = "ARN of ECS task execution role (infrastructure permissions)"
+  value       = aws_iam_role.ecs_task_execution_role.arn
+}
+
+output "lambda_execution_role_arn" {
+  description = "ARN of Lambda execution role"
+  value       = aws_iam_role.lambda_execution_role.arn
+}
+
+# ----------------------------------------------------------------------------
+# Monitoring Outputs
+# ----------------------------------------------------------------------------
+output "cloudwatch_log_group" {
+  description = "CloudWatch Log Group for ECS tasks"
+  value       = aws_cloudwatch_log_group.ecs.name
+}
+
+output "alarm_sns_topic_arn" {
+  description = "SNS topic ARN for CloudWatch alarms"
+  value       = aws_sns_topic.alarms.arn
+}
+
+# ----------------------------------------------------------------------------
+# Security Group Outputs
+# ----------------------------------------------------------------------------
+output "alb_security_group_id" {
+  description = "Security group ID for ALB"
+  value       = aws_security_group.alb.id
+}
+
+output "ecs_security_group_id" {
+  description = "Security group ID for ECS tasks"
+  value       = aws_security_group.ecs_tasks.id
+}
+
+output "rds_security_group_id" {
+  description = "Security group ID for RDS"
+  value       = aws_security_group.rds.id
+}
+
+# ----------------------------------------------------------------------------
+# Environment Information
+# ----------------------------------------------------------------------------
+output "environment" {
+  description = "Deployment environment (dev/staging/prod)"
+  value       = var.environment
+}
+
+output "aws_region" {
+  description = "AWS region where resources are deployed"
+  value       = var.aws_region
+}
+
+# ----------------------------------------------------------------------------
+# Deployment Summary (Multi-line Output)
+# ----------------------------------------------------------------------------
+output "deployment_summary" {
+  description = "Human-readable summary of deployed infrastructure"
+  value       = <<-EOT
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║               DEPLOYMENT SUMMARY - ${upper(var.environment)} ENVIRONMENT                ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+    
+    🌐 APPLICATION URL:
+       → http://${aws_lb.main.dns_name}
+    
+    🖥️  ECS CLUSTER:
+       → Cluster: ${aws_ecs_cluster.main.name}
+       → Service: ${aws_ecs_service.app.name}
+       → Tasks Running: ${var.ecs_desired_count}
+    
+    🗄️  DATABASES:
+       → RDS Endpoint: ${aws_db_instance.main.endpoint}
+       → DynamoDB Table: ${aws_dynamodb_table.main.name}
+    
+    📊 MONITORING:
+       → CloudWatch Logs: ${aws_cloudwatch_log_group.ecs.name}
+       → Alarm SNS Topic: ${aws_sns_topic.alarms.name}
+    
+    🔐 SECURITY:
+       → VPC: ${aws_vpc.main.id}
+       → Private Subnets: ${length(aws_subnet.private)} subnets
+       → Public Subnets: ${length(aws_subnet.public)} subnets
+    
+    📝 NEXT STEPS:
+       1. Configure GitHub Actions secrets with AWS credentials
+       2. Push Docker image to ECR (see CI/CD pipeline)
+       3. Verify health check: curl http://${aws_lb.main.dns_name}/health
+       4. Monitor CloudWatch dashboards
+       5. Confirm SNS subscription via email
+    
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║  Deployed with Terraform ❤️  Region: ${var.aws_region}                 ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+  EOT
+}
+
+# ============================================================================
+# OUTPUT USAGE EXAMPLES:
+# ============================================================================
+# 
+# 1. View all outputs after deployment:
+#    terraform output
+#
+# 2. Get specific output value:
+#    terraform output alb_dns_name
+#
+# 3. Use in scripts (JSON format):
+#    terraform output -json | jq -r '.alb_dns_name.value'
+#
+# 4. Set as environment variable:
+#    export ALB_URL=$(terraform output -raw alb_url)
+#    curl $ALB_URL/health
+#
+# 5. Use in CI/CD (GitHub Actions):
+#    - name: Get ECS cluster name
+#      run: echo "CLUSTER=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_ENV
+#
+# ============================================================================
+
+# ============================================================================
+# SENSITIVE OUTPUTS (For Production):
+# ============================================================================
+# Mark outputs as sensitive to prevent display in logs:
+#
+# output "database_password" {
+#   description = "RDS master password (DO NOT COMMIT)"
+#   value       = random_password.db_password.result
+#   sensitive   = true
+# }
+#
+# Sensitive outputs are hidden in 'terraform output' but accessible via:
+# terraform output -raw database_password
+# ============================================================================
+
+# ============================================================================
+# CROSS-MODULE OUTPUTS (Large Projects):
+# ============================================================================
+# In multi-module Terraform projects, outputs from one module become
+# inputs to another:
+#
+# Module A (VPC):
+#   output "vpc_id" { value = aws_vpc.main.id }
+#
+# Module B (ECS):
+#   variable "vpc_id" { type = string }
+#   module "vpc" { source = "./modules/vpc" }
+#   resource "aws_security_group" "app" {
+#     vpc_id = module.vpc.vpc_id
+#   }
+# ============================================================================

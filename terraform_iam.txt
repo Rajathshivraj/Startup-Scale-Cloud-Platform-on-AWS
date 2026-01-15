@@ -1,0 +1,279 @@
+# ============================================================================
+# IAM Roles and Policies - Least Privilege Security Model
+# ============================================================================
+# This file implements AWS Identity and Access Management following the
+# principle of least privilege: grant ONLY the permissions required for
+# each component to function, nothing more.
+#
+# KEY DISTINCTION:
+# - Task Execution Role: What ECS needs to START your container
+# - Task Role: What your APPLICATION CODE can do while running
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# ECS Task Execution Role - Infrastructure-Level Permissions
+# ----------------------------------------------------------------------------
+# WHAT IT DOES: Allows ECS service to pull Docker images, write logs, retrieve secrets
+# WHO USES IT: ECS control plane (not your application code)
+
+resource "aws_iam_role" "ecs_task_execution_role" {
+  name = "${var.environment}-ecs-task-execution-role"
+
+  # Trust policy: WHO can assume this role
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${var.environment}-ecs-execution-role"
+  }
+}
+
+# TRUST POLICY EXPLAINED: This says "Allow the ECS service to assume this role"
+# Similar to giving ECS service a "badge" to perform infrastructure tasks on your behalf
+
+# ----------------------------------------------------------------------------
+# Attach AWS-Managed Policy for ECS Execution
+# ----------------------------------------------------------------------------
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_policy" {
+  role       = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# AWS-MANAGED POLICY INCLUDES:
+# - ecr:GetAuthorizationToken (login to ECR)
+# - ecr:BatchGetImage (pull Docker images)
+# - logs:CreateLogStream (create log streams in CloudWatch)
+# - logs:PutLogEvents (write logs to CloudWatch)
+
+# PRODUCTION ENHANCEMENT: Add secretsmanager:GetSecretValue for database credentials
+# resource "aws_iam_role_policy_attachment" "secrets_policy" {
+#   role       = aws_iam_role.ecs_task_execution_role.name
+#   policy_arn = "arn:aws:iam::aws:policy/SecretsManagerReadWrite"
+# }
+
+# ----------------------------------------------------------------------------
+# ECS Task Role - Application-Level Permissions
+# ----------------------------------------------------------------------------
+# WHAT IT DOES: Defines what AWS services your application code can access
+# WHO USES IT: Your Flask app, when making boto3 API calls
+
+resource "aws_iam_role" "ecs_task_role" {
+  name = "${var.environment}-ecs-task-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${var.environment}-ecs-task-role"
+  }
+}
+
+# ----------------------------------------------------------------------------
+# Custom Policy for Task Role - DynamoDB Access
+# ----------------------------------------------------------------------------
+resource "aws_iam_role_policy" "ecs_task_dynamodb_policy" {
+  name = "${var.environment}-dynamodb-access"
+  role = aws_iam_role.ecs_task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:GetItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:Scan"
+        ]
+        Resource = [
+          aws_dynamodb_table.main.arn,
+          "${aws_dynamodb_table.main.arn}/*" # Includes indexes
+        ]
+      }
+    ]
+  })
+}
+
+# SECURITY PRINCIPLE: Grant access to SPECIFIC DynamoDB table only (not all tables)
+# Wildcard /* includes Global Secondary Indexes (GSI) and Local Secondary Indexes (LSI)
+
+# ----------------------------------------------------------------------------
+# CloudWatch Logs Policy for Task Role
+# ----------------------------------------------------------------------------
+resource "aws_iam_role_policy" "ecs_task_cloudwatch_policy" {
+  name = "${var.environment}-cloudwatch-logs"
+  role = aws_iam_role.ecs_task_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${var.aws_region}:*:log-group:/ecs/${var.environment}-*"
+      }
+    ]
+  })
+}
+
+# SCOPING: Log group ARN limits permissions to logs starting with /ecs/dev-*
+# Prevents accidental access to production logs from dev environment
+
+# ----------------------------------------------------------------------------
+# Lambda Execution Role - Serverless Function Permissions
+# ----------------------------------------------------------------------------
+resource "aws_iam_role" "lambda_execution_role" {
+  name = "${var.environment}-lambda-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name = "${var.environment}-lambda-role"
+  }
+}
+
+# ----------------------------------------------------------------------------
+# Lambda Basic Execution Policy (CloudWatch Logs)
+# ----------------------------------------------------------------------------
+resource "aws_iam_role_policy_attachment" "lambda_basic_policy" {
+  role       = aws_iam_role.lambda_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# AWS-MANAGED POLICY INCLUDES:
+# - logs:CreateLogGroup
+# - logs:CreateLogStream
+# - logs:PutLogEvents
+# Lambda automatically creates log groups in /aws/lambda/<function-name>
+
+# ----------------------------------------------------------------------------
+# Lambda DynamoDB Access Policy
+# ----------------------------------------------------------------------------
+resource "aws_iam_role_policy" "lambda_dynamodb_policy" {
+  name = "${var.environment}-lambda-dynamodb"
+  role = aws_iam_role.lambda_execution_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem"
+        ]
+        Resource = aws_dynamodb_table.main.arn
+      }
+    ]
+  })
+}
+
+# LEAST PRIVILEGE: Lambda only needs Get/Put/Update (no Delete or Scan)
+# Reduces blast radius if Lambda function is compromised
+
+# ----------------------------------------------------------------------------
+# Lambda VPC Execution Policy (If Lambda Needs RDS Access)
+# ----------------------------------------------------------------------------
+resource "aws_iam_role_policy_attachment" "lambda_vpc_policy" {
+  role       = aws_iam_role.lambda_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+# REQUIRED FOR: Lambda functions deployed inside VPC (to access RDS/private resources)
+# INCLUDES: ENI creation/deletion permissions for Lambda-managed network interfaces
+
+# ============================================================================
+# SECURITY BEST PRACTICES (Interview Talking Points):
+# ============================================================================
+# 1. SEPARATION OF CONCERNS:
+#    - Execution Role = infrastructure ops (pulling images, writing logs)
+#    - Task Role = application permissions (accessing DynamoDB, S3)
+#
+# 2. RESOURCE-LEVEL PERMISSIONS:
+#    - Use specific ARNs (not "*") wherever possible
+#    - Example: dynamodb:GetItem on arn:aws:dynamodb:region:account:table/MyTable
+#
+# 3. CONDITION KEYS (Advanced):
+#    - Add IP restrictions: "Condition": {"IpAddress": {"aws:SourceIp": ["10.0.0.0/16"]}}
+#    - MFA requirement: "Condition": {"Bool": {"aws:MultiFactorAuthPresent": "true"}}
+#
+# 4. NO LONG-LIVED CREDENTIALS:
+#    - Never put access keys in environment variables
+#    - Use IAM roles with STS temporary credentials (auto-rotated hourly)
+#
+# 5. AUDIT AND COMPLIANCE:
+#    - All role assumptions logged in CloudTrail
+#    - Use AWS IAM Access Analyzer to detect overly permissive policies
+# ============================================================================
+
+# ============================================================================
+# PRODUCTION ENHANCEMENTS:
+# ============================================================================
+# 1. Secrets Management:
+#    - Store RDS password in AWS Secrets Manager
+#    - Grant ecs_task_execution_role permission to retrieve secret
+#    - Reference secret ARN in ECS task definition (not plaintext password)
+#
+# 2. Cross-Account Access:
+#    - For multi-account setups (dev/staging/prod in separate AWS accounts)
+#    - Use role assumption across accounts with external ID for security
+#
+# 3. Permission Boundaries:
+#    - Attach permission boundary to roles to enforce max permissions
+#    - Prevents privilege escalation even if IAM policy is modified
+# ============================================================================
+
+# OUTPUT: Role ARNs for use in other resources
+output "ecs_task_execution_role_arn" {
+  description = "ARN of ECS Task Execution Role"
+  value       = aws_iam_role.ecs_task_execution_role.arn
+}
+
+output "ecs_task_role_arn" {
+  description = "ARN of ECS Task Role (application permissions)"
+  value       = aws_iam_role.ecs_task_role.arn
+}
+
+output "lambda_execution_role_arn" {
+  description = "ARN of Lambda Execution Role"
+  value       = aws_iam_role.lambda_execution_role.arn
+}

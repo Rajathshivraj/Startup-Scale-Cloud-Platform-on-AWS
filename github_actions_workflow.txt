@@ -1,0 +1,401 @@
+# ============================================================================
+# GitHub Actions CI/CD Pipeline - Automated Deployment to AWS ECS
+# ============================================================================
+# This workflow automates the complete deployment lifecycle:
+# 1. Triggered on push to main branch
+# 2. Builds Docker image
+# 3. Scans for security vulnerabilities
+# 4. Pushes image to Amazon ECR
+# 5. Updates ECS task definition
+# 6. Deploys to ECS Fargate with zero downtime
+#
+# PREREQUISITES (GitHub Secrets):
+# - AWS_ACCESS_KEY_ID
+# - AWS_SECRET_ACCESS_KEY
+# - AWS_REGION
+# - ECR_REPOSITORY
+# - ECS_CLUSTER
+# - ECS_SERVICE
+# ============================================================================
+
+name: Deploy to AWS ECS
+
+# ============================================================================
+# Workflow Triggers
+# ============================================================================
+on:
+  push:
+    branches:
+      - main  # Production deployments
+      - develop  # Staging deployments (if multi-environment)
+  
+  # Manual trigger with environment selection
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+# ============================================================================
+# Environment Variables (Shared Across Jobs)
+# ============================================================================
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: startup-platform
+  ECS_CLUSTER: dev-startup-cluster
+  ECS_SERVICE: dev-startup-service
+  CONTAINER_NAME: app
+
+# ============================================================================
+# Jobs
+# ============================================================================
+jobs:
+  
+  # --------------------------------------------------------------------------
+  # Job 1: Build and Deploy
+  # --------------------------------------------------------------------------
+  deploy:
+    name: Build and Deploy to ECS
+    runs-on: ubuntu-latest
+    
+    # PERMISSIONS: Required for OIDC authentication (alternative to access keys)
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      
+      # ------------------------------------------------------------------------
+      # Step 1: Checkout Code
+      # ------------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        # Fetches entire repository including Dockerfile, app code, etc.
+      
+      # ------------------------------------------------------------------------
+      # Step 2: Configure AWS Credentials
+      # ------------------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      # ALTERNATIVE: Use OIDC (no long-lived credentials)
+      # - name: Configure AWS credentials (OIDC)
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+      #     aws-region: ${{ env.AWS_REGION }}
+      
+      # ------------------------------------------------------------------------
+      # Step 3: Login to Amazon ECR
+      # ------------------------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        # Authenticates Docker to push images to ECR
+      
+      # ------------------------------------------------------------------------
+      # Step 4: Build Docker Image
+      # ------------------------------------------------------------------------
+      - name: Build Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}  # Use Git commit SHA as image tag
+        run: |
+          # Build image with commit SHA tag
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f docker/Dockerfile .
+          
+          # Also tag as 'latest' for convenience
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Output image URI for next steps
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+      
+      # TAGGING STRATEGY:
+      # - Git SHA: Immutable, traceable to specific commit
+      # - 'latest': Convenient for manual testing
+      # - Semantic version (v1.2.3): For release branches
+      
+      # ------------------------------------------------------------------------
+      # Step 5: Security Scan with Trivy
+      # ------------------------------------------------------------------------
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true  # Don't fail build on vulnerabilities (log only)
+      
+      # PRODUCTION: Set continue-on-error: false to block vulnerable deployments
+      # Integrate with GitHub Security tab for vulnerability tracking
+      
+      # ------------------------------------------------------------------------
+      # Step 6: Upload Trivy Results to GitHub Security
+      # ------------------------------------------------------------------------
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()  # Upload even if previous step fails
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      # ------------------------------------------------------------------------
+      # Step 7: Push Image to ECR
+      # ------------------------------------------------------------------------
+      - name: Push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Push both SHA tag and latest tag
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          echo "✅ Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+      
+      # ------------------------------------------------------------------------
+      # Step 8: Download Current ECS Task Definition
+      # ------------------------------------------------------------------------
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_SERVICE }} \
+            --query taskDefinition \
+            > task-definition.json
+          
+          # Remove fields that cause RegisterTaskDefinition to fail
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition.json > task-definition-clean.json
+      
+      # WHY: ECS requires task definition JSON to update service
+      # Can't just specify image - must register new task definition revision
+      
+      # ------------------------------------------------------------------------
+      # Step 9: Update Task Definition with New Image
+      # ------------------------------------------------------------------------
+      - name: Fill in new image ID in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition-clean.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+      
+      # This updates the container image in task definition JSON
+      # Creates new file with updated image reference
+      
+      # ------------------------------------------------------------------------
+      # Step 10: Deploy to ECS
+      # ------------------------------------------------------------------------
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+      
+      # DEPLOYMENT PROCESS:
+      # 1. Register new task definition revision
+      # 2. Update ECS service to use new revision
+      # 3. ECS starts new tasks with new image
+      # 4. Wait for health checks to pass
+      # 5. Drain connections from old tasks
+      # 6. Stop old tasks
+      # 7. Return success (or rollback on failure)
+      
+      # wait-for-service-stability: true
+      # - Waits up to 10 minutes for deployment to complete
+      # - Fails pipeline if deployment fails (automatic rollback)
+      
+      # ------------------------------------------------------------------------
+      # Step 11: Verify Deployment
+      # ------------------------------------------------------------------------
+      - name: Verify deployment
+        run: |
+          # Get ALB DNS name from Terraform outputs (or hardcode)
+          ALB_DNS="${{ secrets.ALB_DNS_NAME }}"
+          
+          # Wait for ALB to route traffic to new tasks
+          echo "Waiting 30 seconds for ALB to update..."
+          sleep 30
+          
+          # Health check
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_DNS/health)
+          
+          if [ $RESPONSE -eq 200 ]; then
+            echo "✅ Deployment successful! Health check returned 200"
+          else
+            echo "❌ Deployment failed! Health check returned $RESPONSE"
+            exit 1
+          fi
+      
+      # ------------------------------------------------------------------------
+      # Step 12: Send Deployment Notification
+      # ------------------------------------------------------------------------
+      - name: Send Slack notification
+        if: always()  # Run even if previous steps fail
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅ Deployment Successful' || '❌ Deployment Failed' }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Status:* ${{ job.status }}\n*Environment:* ${{ env.ECS_CLUSTER }}\n*Commit:* ${{ github.sha }}\n*Author:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        continue-on-error: true  # Don't fail pipeline if Slack fails
+
+# ============================================================================
+# ADDITIONAL JOBS (Optional Production Enhancements)
+# ============================================================================
+
+  # --------------------------------------------------------------------------
+  # Job 2: Run Tests Before Deployment
+  # --------------------------------------------------------------------------
+  # test:
+  #   name: Run Unit Tests
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: '3.11'
+  #     - run: pip install -r requirements.txt
+  #     - run: pytest tests/ --junitxml=test-results.xml
+  #     - uses: actions/upload-artifact@v3
+  #       with:
+  #         name: test-results
+  #         path: test-results.xml
+  
+  # --------------------------------------------------------------------------
+  # Job 3: Database Migrations
+  # --------------------------------------------------------------------------
+  # migrate:
+  #   name: Run Database Migrations
+  #   needs: test
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Run Alembic migrations
+  #       run: |
+  #         pip install alembic psycopg2-binary
+  #         alembic upgrade head
+  
+  # --------------------------------------------------------------------------
+  # Job 4: Smoke Tests After Deployment
+  # --------------------------------------------------------------------------
+  # smoke-test:
+  #   name: Run Smoke Tests
+  #   needs: deploy
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Test critical endpoints
+  #       run: |
+  #         curl -f http://$ALB_DNS/health || exit 1
+  #         curl -f http://$ALB_DNS/api/items || exit 1
+
+# ============================================================================
+# GITHUB SECRETS CONFIGURATION:
+# ============================================================================
+# Navigate to: Repository → Settings → Secrets and Variables → Actions
+#
+# Required Secrets:
+# - AWS_ACCESS_KEY_ID: IAM user access key (or use OIDC)
+# - AWS_SECRET_ACCESS_KEY: IAM user secret key
+# - ALB_DNS_NAME: Load balancer DNS (for health check verification)
+# - SLACK_WEBHOOK_URL: (Optional) For deployment notifications
+#
+# IAM User Permissions (Minimum):
+# - ecr:GetAuthorizationToken
+# - ecr:BatchCheckLayerAvailability
+# - ecr:PutImage
+# - ecr:InitiateLayerUpload
+# - ecr:UploadLayerPart
+# - ecr:CompleteLayerUpload
+# - ecs:DescribeTaskDefinition
+# - ecs:RegisterTaskDefinition
+# - ecs:UpdateService
+# - ecs:DescribeServices
+# ============================================================================
+
+# ============================================================================
+# WORKFLOW OPTIMIZATION TIPS:
+# ============================================================================
+# 1. CACHING:
+#    - Cache Docker layers (use buildx with GitHub Actions cache)
+#    - Cache pip dependencies
+#
+# 2. PARALLEL JOBS:
+#    - Run tests, linting, security scans in parallel
+#    - Only block deployment on critical failures
+#
+# 3. MATRIX BUILDS:
+#    - Test multiple Python versions simultaneously
+#    - Deploy to multiple environments (dev/staging/prod) with matrix
+#
+# 4. REUSABLE WORKFLOWS:
+#    - Extract common steps to reusable workflow files
+#    - DRY principle for multi-repo organizations
+# ============================================================================
+
+# ============================================================================
+# INTERVIEW TALKING POINTS:
+# ============================================================================
+# Q: How do you handle deployment failures?
+# A: wait-for-service-stability detects failures, ECS automatically rolls back
+#    to previous task definition. CloudWatch alarms trigger for investigation.
+#
+# Q: How do you achieve zero-downtime deployments?
+# A: ECS rolling update with minimum_healthy_percent=100 ensures new tasks are
+#    healthy before old tasks are stopped. ALB drains connections gracefully.
+#
+# Q: How do you prevent bad code from reaching production?
+# A: Multi-stage pipeline: unit tests → integration tests → security scan →
+#    deploy to staging → smoke tests → manual approval → production deploy.
+#
+# Q: What's the difference between access keys and OIDC?
+# A: Access keys are long-lived credentials (security risk if leaked). OIDC
+#    uses temporary tokens via trust relationship (no keys in GitHub).
+# ============================================================================
+
+# ============================================================================
+# PRODUCTION ENHANCEMENTS:
+# ============================================================================
+# 1. Blue/Green Deployments:
+#    - Use AWS CodeDeploy for instant rollback capability
+#    - Maintain two production environments, switch traffic via ALB
+#
+# 2. Canary Deployments:
+#    - Route 10% traffic to new version, monitor metrics, gradual rollout
+#
+# 3. Feature Flags:
+#    - Decouple deployment from release (deploy code, enable features via flags)
+#    - Use LaunchDarkly or AWS AppConfig
+#
+# 4. Automated Rollback:
+#    - Monitor CloudWatch alarms during deployment
+#    - Trigger automatic rollback if error rate exceeds threshold
+#
+# 5. Multi-Region Deployments:
+#    - Deploy to us-east-1, us-west-2 simultaneously
+#    - Route 53 weighted routing for global traffic distribution
+# ============================================================================

@@ -1,0 +1,182 @@
+# ============================================================================
+# Multi-Stage Docker Build for Python Flask Application
+# ============================================================================
+# Multi-stage builds separate build dependencies from runtime, resulting in
+# smaller, more secure production images.
+#
+# BENEFITS:
+# - Smaller image size (no build tools in final image)
+# - Faster deployment (less data to transfer to ECS)
+# - Improved security (reduced attack surface)
+# - Cached layers speed up subsequent builds
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# STAGE 1: Builder - Compile Dependencies
+# ----------------------------------------------------------------------------
+FROM python:3.11-slim AS builder
+
+# Set working directory for build
+WORKDIR /build
+
+# OPTIMIZATION: Install dependencies first (separate layer for caching)
+# Docker caches layers - if requirements.txt unchanged, this layer is reused
+COPY requirements.txt .
+
+# Create virtual environment and install dependencies
+# WHY VENV IN DOCKER: Isolates packages, prevents system Python conflicts
+RUN python -m venv /opt/venv && \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# NO-CACHE-DIR: Don't store pip cache (saves ~100MB in image size)
+
+# ----------------------------------------------------------------------------
+# STAGE 2: Runtime - Minimal Production Image
+# ----------------------------------------------------------------------------
+FROM python:3.11-slim
+
+# Metadata labels (best practice for image tagging)
+LABEL maintainer="devops@startup.com"
+LABEL description="Startup Platform Flask API"
+LABEL version="1.0.0"
+
+# Create non-root user for security
+# PRINCIPLE: Never run containers as root (limits damage if compromised)
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Set working directory
+WORKDIR /app
+
+# Copy virtual environment from builder stage
+COPY --from=builder /opt/venv /opt/venv
+
+# Copy application code
+COPY ../app/app.py .
+
+# Install curl for health checks (used by ECS health check command)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+# CLEANUP: Remove apt cache to reduce image size
+
+# Change ownership to non-root user
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Activate virtual environment
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Set Python environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONHASHSEED=random
+
+# PYTHONUNBUFFERED: Ensures logs appear immediately (critical for CloudWatch)
+# PYTHONDONTWRITEBYTECODE: Don't create .pyc files (not needed in container)
+# PYTHONHASHSEED: Security hardening (randomize hash seeds)
+
+# Expose port (documentation only, doesn't actually publish port)
+EXPOSE 5000
+
+# Health check (Docker-level, independent of ECS health check)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Start application
+# Use exec form (array) for proper signal handling (SIGTERM for graceful shutdown)
+CMD ["python", "app.py"]
+
+# ============================================================================
+# ALTERNATIVE START COMMANDS:
+# ============================================================================
+# Production: Use gunicorn for production WSGI server
+# CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--timeout", "60", "app:app"]
+#
+# With environment variable configuration:
+# CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} --workers ${WORKERS:-4} app:app"]
+# ============================================================================
+
+# ============================================================================
+# BUILD AND RUN COMMANDS:
+# ============================================================================
+# Build image:
+#   docker build -t startup-platform:latest -f docker/Dockerfile .
+#
+# Run locally:
+#   docker run -p 5000:5000 -e ENVIRONMENT=dev startup-platform:latest
+#
+# Push to ECR:
+#   aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <account>.dkr.ecr.us-east-1.amazonaws.com
+#   docker tag startup-platform:latest <account>.dkr.ecr.us-east-1.amazonaws.com/startup-platform:latest
+#   docker push <account>.dkr.ecr.us-east-1.amazonaws.com/startup-platform:latest
+# ============================================================================
+
+# ============================================================================
+# SECURITY BEST PRACTICES:
+# ============================================================================
+# ✅ Multi-stage build (smaller attack surface)
+# ✅ Non-root user (principle of least privilege)
+# ✅ Minimal base image (python:slim, not full python image)
+# ✅ No secrets in image (use environment variables or Secrets Manager)
+# ✅ Specific base image version (python:3.11-slim, not python:latest)
+# ✅ Health check defined (automatic container restart if unhealthy)
+#
+# PRODUCTION ADDITIONS:
+# - Scan image with Trivy/Snyk in CI/CD pipeline
+# - Sign images with Docker Content Trust
+# - Use distroless or Alpine base for even smaller size
+# - Implement proper logging (structured JSON logs)
+# ============================================================================
+
+# ============================================================================
+# IMAGE SIZE OPTIMIZATION:
+# ============================================================================
+# BEFORE optimization (full python image):
+#   - python:3.11 = ~1GB
+#   - With dependencies = ~1.2GB
+#
+# AFTER optimization (slim + multi-stage):
+#   - python:3.11-slim = ~200MB
+#   - Multi-stage build = ~250MB
+#
+# FURTHER OPTIMIZATION (distroless):
+#   - gcr.io/distroless/python3 = ~50MB (no shell, ultra-secure)
+# ============================================================================
+
+# ============================================================================
+# INTERVIEW TALKING POINTS:
+# ============================================================================
+# Q: Why multi-stage builds?
+# A: Separate build tools from runtime, reducing final image size by 70%+
+#    and removing unnecessary attack vectors.
+#
+# Q: Why not use latest tag?
+# A: Latest tag is ambiguous and can cause inconsistent deployments.
+#    Always pin to specific version (python:3.11-slim) for reproducibility.
+#
+# Q: How do you handle secrets in Docker?
+# A: NEVER bake secrets into image layers. Use:
+#    - Environment variables (injected at runtime by ECS)
+#    - AWS Secrets Manager (pulled by task execution role)
+#    - Docker secrets (for Swarm/Kubernetes)
+#
+# Q: What's the difference between CMD and ENTRYPOINT?
+# A: ENTRYPOINT defines the executable, CMD provides default arguments.
+#    ENTRYPOINT can't be overridden (unless using --entrypoint flag).
+#    Best practice: Use CMD for flexibility in ECS task definitions.
+# ============================================================================
+
+# ============================================================================
+# REQUIREMENTS.TXT (Place in project root):
+# ============================================================================
+# Flask==3.0.0
+# boto3==1.34.0         # AWS SDK for Python
+# psycopg2-binary==2.9.9  # PostgreSQL adapter
+# gunicorn==21.2.0      # Production WSGI server
+# python-dotenv==1.0.0  # Load environment variables from .env
+# requests==2.31.0      # HTTP library
+# ============================================================================

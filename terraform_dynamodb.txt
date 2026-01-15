@@ -1,0 +1,246 @@
+# ============================================================================
+# Amazon DynamoDB - NoSQL Database
+# ============================================================================
+# Fully managed NoSQL database designed for single-digit millisecond latency
+# at any scale. Ideal for key-value lookups, session storage, and high-throughput
+# write operations.
+#
+# USE CASES:
+# - User sessions (fast reads, TTL expiration)
+# - Application configuration (key-value store)
+# - Event logs and time-series data
+# - Leaderboards and counting
+#
+# RDS vs DynamoDB Decision Matrix:
+# - Use RDS: Complex queries, transactions, relational data
+# - Use DynamoDB: Simple lookups, massive scale, unpredictable traffic
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# DynamoDB Table
+# ----------------------------------------------------------------------------
+resource "aws_dynamodb_table" "main" {
+  name         = var.dynamodb_table_name
+  billing_mode = var.dynamodb_billing_mode # PAY_PER_REQUEST or PROVISIONED
+
+  # PARTITION KEY (Required)
+  hash_key = "id" # Primary key for direct lookups
+
+  # SORT KEY (Optional) - Enables range queries
+  range_key = "timestamp"
+
+  # ATTRIBUTE DEFINITIONS
+  # IMPORTANT: Only define keys and index attributes (not all table attributes)
+  attribute {
+    name = "id"
+    type = "S" # S=String, N=Number, B=Binary
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "N" # Store as Unix timestamp (milliseconds since epoch)
+  }
+
+  attribute {
+    name = "user_id"
+    type = "S" # For GSI (querying by user)
+  }
+
+  # GLOBAL SECONDARY INDEX (GSI) - Alternate Query Pattern
+  global_secondary_index {
+    name            = "UserIndex"
+    hash_key        = "user_id"
+    range_key       = "timestamp"
+    projection_type = "ALL" # ALL, KEYS_ONLY, or INCLUDE (specific attributes)
+
+    # ONLY for PROVISIONED billing mode:
+    # read_capacity  = 5
+    # write_capacity = 5
+  }
+
+  # ENCRYPTION AT REST (Always enabled in modern DynamoDB)
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = null # Use AWS-managed key (free), or specify CMK for compliance
+  }
+
+  # TTL (Time To Live) - Automatic Item Expiration
+  ttl {
+    attribute_name = "expiration_time"
+    enabled        = true
+  }
+  # USAGE: Set expiration_time = Unix timestamp, DynamoDB auto-deletes expired items
+  # Example: Store session that expires in 30 minutes
+
+  # POINT-IN-TIME RECOVERY (PITR) - Continuous Backups
+  point_in_time_recovery {
+    enabled = true # Enables restore to any point in last 35 days
+  }
+
+  # STREAM CONFIGURATION - Capture Table Changes
+  stream_enabled   = true
+  stream_view_type = "NEW_AND_OLD_IMAGES" # Options: KEYS_ONLY, NEW_IMAGE, OLD_IMAGE, NEW_AND_OLD_IMAGES
+
+  tags = {
+    Name = "${var.environment}-dynamodb-table"
+  }
+}
+
+# DynamoDB Streams Use Cases:
+# - Trigger Lambda function when item created/updated (real-time processing)
+# - Cross-region replication (DynamoDB Global Tables)
+# - Audit logging (track all changes)
+# - Data aggregation (update counters/materialized views)
+
+# ============================================================================
+# KEY CONCEPTS FOR INTERVIEWS:
+# ============================================================================
+# 1. PARTITION KEY (Hash Key):
+#    - Determines which partition stores the item
+#    - Must be unique for direct lookups (e.g., user_id, order_id)
+#    - DynamoDB distributes data across partitions based on hash of key
+#
+# 2. SORT KEY (Range Key):
+#    - Optional, enables sorted range queries within a partition
+#    - Example: partition_key=user_id, sort_key=timestamp → Query "all actions by user in date range"
+#
+# 3. COMPOSITE PRIMARY KEY:
+#    - Partition key + Sort key = unique identifier
+#    - Allows multiple items with same partition key (different sort keys)
+#
+# 4. GLOBAL SECONDARY INDEX (GSI):
+#    - Alternate query pattern (different partition/sort key)
+#    - Eventually consistent (slight replication delay)
+#    - Can project subset of attributes to reduce storage cost
+#
+# 5. LOCAL SECONDARY INDEX (LSI):
+#    - Same partition key, different sort key
+#    - Strongly consistent
+#    - Must be created at table creation time (cannot add later)
+# ============================================================================
+
+# ============================================================================
+# CAPACITY MODES EXPLAINED:
+# ============================================================================
+# ON-DEMAND (PAY_PER_REQUEST):
+# - No capacity planning needed
+# - Pay per read/write request ($1.25 per million writes, $0.25 per million reads)
+# - Best for: Unpredictable traffic, new applications, spiky workloads
+# - Auto-scales instantly to handle any traffic
+#
+# PROVISIONED:
+# - Specify read/write capacity units (RCU/WCU)
+# - 1 RCU = 1 strongly consistent read/sec (4 KB)
+# - 1 WCU = 1 write/sec (1 KB)
+# - Cheaper for steady-state traffic (predictable load)
+# - Can enable auto-scaling for provisioned mode
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Lambda Function for DynamoDB Stream Processing (Example)
+# ----------------------------------------------------------------------------
+# PRODUCTION PATTERN: Process table changes in real-time
+# resource "aws_lambda_event_source_mapping" "dynamodb_stream" {
+#   event_source_arn  = aws_dynamodb_table.main.stream_arn
+#   function_name     = aws_lambda_function.stream_processor.arn
+#   starting_position = "LATEST" # LATEST or TRIM_HORIZON (beginning of stream)
+#
+#   batch_size        = 100 # Process up to 100 records per invocation
+#   maximum_batching_window_in_seconds = 10 # Wait up to 10s to accumulate batch
+# }
+
+# ============================================================================
+# ACCESS PATTERNS & QUERY EXAMPLES:
+# ============================================================================
+# 1. GET ITEM (O(1) lookup by primary key):
+#    GetItem(TableName="startup-data", Key={"id": "user123", "timestamp": 1699999999})
+#
+# 2. QUERY (Efficient range query on partition):
+#    Query(
+#      TableName="startup-data",
+#      KeyConditionExpression="user_id = :uid AND timestamp BETWEEN :start AND :end",
+#      IndexName="UserIndex"
+#    )
+#
+# 3. SCAN (Full table scan - AVOID IN PRODUCTION):
+#    Scan(TableName="startup-data")
+#    WARNING: Expensive, slow, consumes all RCUs - use Query with GSI instead
+#
+# 4. BATCH OPERATIONS (Up to 25 items):
+#    BatchGetItem() / BatchWriteItem()
+# ============================================================================
+
+# ============================================================================
+# BEST PRACTICES:
+# ============================================================================
+# 1. Design for Access Patterns:
+#    - Identify all query patterns upfront
+#    - Create GSIs for each unique access pattern
+#    - Avoid Scan operations (use Query with appropriate keys)
+#
+# 2. Hot Partitions:
+#    - Avoid using sequential IDs (e.g., user1, user2, user3)
+#    - Use high-cardinality partition keys (UUIDs, timestamps + random suffix)
+#    - Uneven key distribution causes throttling on hot partitions
+#
+# 3. Item Size:
+#    - Max 400 KB per item (use S3 for large objects, store S3 key in DynamoDB)
+#    - Denormalize data (store related info in same item to reduce queries)
+#
+# 4. Cost Optimization:
+#    - Use on-demand for dev/staging (no idle cost)
+#    - Switch to provisioned with auto-scaling for predictable production traffic
+#    - Project only needed attributes in GSI (reduces storage cost)
+#    - Enable TTL to auto-delete old data
+# ============================================================================
+
+# ============================================================================
+# MONITORING:
+# ============================================================================
+# Key CloudWatch Metrics:
+# - ConsumedReadCapacityUnits / ConsumedWriteCapacityUnits
+# - ThrottledRequests (indicates capacity exceeded)
+# - UserErrors (4xx client errors - check application logic)
+# - SystemErrors (5xx server errors - AWS issues)
+# - SuccessfulRequestLatency (p50, p99 latency)
+#
+# Set Alarms On:
+# - ThrottledRequests > 0 (capacity planning issue)
+# - UserErrors > threshold (application bug)
+# ============================================================================
+
+# ============================================================================
+# COST EXAMPLE (us-east-1):
+# ============================================================================
+# ON-DEMAND Pricing:
+# - 1 million writes = $1.25
+# - 1 million reads = $0.25
+# - Storage: $0.25/GB-month
+#
+# Example App (1000 users, 1M requests/month):
+# - 500K writes = $0.63
+# - 500K reads = $0.13
+# - 5 GB storage = $1.25
+# - Total: ~$2/month
+#
+# PROVISIONED Pricing (100 RCU, 100 WCU):
+# - $0.00065 per RCU-hour = $47/month
+# - $0.00065 per WCU-hour = $47/month
+# - Total: ~$94/month (break-even at ~75M requests/month)
+# ============================================================================
+
+# OUTPUT: Table information for application
+output "dynamodb_table_name" {
+  description = "Name of DynamoDB table"
+  value       = aws_dynamodb_table.main.name
+}
+
+output "dynamodb_table_arn" {
+  description = "ARN of DynamoDB table"
+  value       = aws_dynamodb_table.main.arn
+}
+
+output "dynamodb_stream_arn" {
+  description = "ARN of DynamoDB stream (for Lambda triggers)"
+  value       = aws_dynamodb_table.main.stream_arn
+}

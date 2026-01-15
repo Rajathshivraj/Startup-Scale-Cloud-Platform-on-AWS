@@ -1,0 +1,355 @@
+# ============================================================================
+# CloudWatch Monitoring and Alarms - Observability Layer
+# ============================================================================
+# CloudWatch provides unified monitoring for all AWS resources, application logs,
+# and custom metrics. This file implements proactive alerting for critical
+# infrastructure health indicators.
+#
+# MONITORING PHILOSOPHY:
+# - Monitor symptoms (high latency, errors) not causes (CPU, memory)
+# - Alert on user-impacting issues, not internal metrics
+# - Define clear thresholds and escalation paths
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# SNS Topic for Alarm Notifications
+# ----------------------------------------------------------------------------
+resource "aws_sns_topic" "alarms" {
+  name = "${var.environment}-infrastructure-alarms"
+
+  tags = {
+    Name = "${var.environment}-sns-alarms"
+  }
+}
+
+# SNS TOPIC PURPOSE: Fan-out notifications to multiple subscribers
+# Can send to: Email, SMS, Lambda, SQS, HTTP endpoints, PagerDuty integration
+
+# ----------------------------------------------------------------------------
+# SNS Email Subscription (Manual Confirmation Required)
+# ----------------------------------------------------------------------------
+resource "aws_sns_topic_subscription" "alarm_email" {
+  topic_arn = aws_sns_topic.alarms.arn
+  protocol  = "email"
+  endpoint  = var.alarm_email
+}
+
+# IMPORTANT: After terraform apply, check email and click "Confirm subscription"
+# Terraform cannot auto-confirm email subscriptions (AWS security measure)
+
+# PRODUCTION ALTERNATIVES:
+# - PagerDuty: protocol = "https", endpoint = PagerDuty webhook URL
+# - Slack: Lambda function that posts to Slack webhook
+# - OpsGenie: Native integration available
+
+# ----------------------------------------------------------------------------
+# CloudWatch Alarm: ALB Target Health
+# ----------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "unhealthy_targets" {
+  alarm_name          = "${var.environment}-unhealthy-targets"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2 # Alarm after 2 consecutive failures
+  metric_name         = "UnHealthyHostCount"
+  namespace           = "AWS/ApplicationELB"
+  period              = 60 # Check every 60 seconds
+  statistic           = "Average"
+  threshold           = 0 # Alert if ANY unhealthy targets exist
+  alarm_description   = "Triggers when ECS tasks fail health checks"
+  treat_missing_data  = "notBreaching" # Don't alarm if no data (e.g., during maintenance)
+
+  # DIMENSIONS: Specify which ALB to monitor
+  dimensions = {
+    LoadBalancer = aws_lb.main.arn_suffix
+    TargetGroup  = aws_lb_target_group.app.arn_suffix
+  }
+
+  # ACTIONS: What happens when alarm state changes
+  alarm_actions             = [aws_sns_topic.alarms.arn] # ALARM → OK
+  ok_actions                = [aws_sns_topic.alarms.arn] # OK → ALARM (recovery notification)
+  insufficient_data_actions = []                         # No action on insufficient data
+
+  tags = {
+    Name     = "${var.environment}-unhealthy-targets-alarm"
+    Severity = "Critical"
+  }
+}
+
+# WHY THIS ALARM MATTERS: Unhealthy targets = users getting errors
+# Root Causes: App crashes, health check endpoint failures, resource exhaustion
+
+# ----------------------------------------------------------------------------
+# CloudWatch Alarm: ALB 5xx Errors (Server-Side Errors)
+# ----------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "alb_5xx_errors" {
+  alarm_name          = "${var.environment}-alb-5xx-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "HTTPCode_Target_5XX_Count"
+  namespace           = "AWS/ApplicationELB"
+  period              = 300 # 5-minute window
+  statistic           = "Sum"
+  threshold           = 10 # Alert if > 10 errors in 5 minutes
+  alarm_description   = "High rate of 5xx errors from ECS tasks"
+
+  dimensions = {
+    LoadBalancer = aws_lb.main.arn_suffix
+  }
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.environment}-5xx-errors-alarm"
+    Severity = "High"
+  }
+}
+
+# 5XX ERROR TYPES:
+# - 500 Internal Server Error: Application exception
+# - 502 Bad Gateway: Task crashed or unhealthy
+# - 503 Service Unavailable: No healthy targets
+# - 504 Gateway Timeout: Task response > 60 seconds
+
+# ----------------------------------------------------------------------------
+# CloudWatch Alarm: ECS Service CPU Utilization
+# ----------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "ecs_high_cpu" {
+  alarm_name          = "${var.environment}-ecs-high-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 3 # Sustained high CPU (3 consecutive periods)
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/ECS"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 80 # Alert if CPU > 80%
+  alarm_description   = "ECS service CPU usage is high - consider scaling"
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.app.name
+  }
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.environment}-ecs-cpu-alarm"
+    Severity = "Medium"
+  }
+}
+
+# HIGH CPU CAUSES:
+# - Inefficient code (infinite loops, heavy computation)
+# - Traffic spike (auto-scaling not fast enough)
+# - Under-provisioned task size (increase ecs_task_cpu)
+
+# ----------------------------------------------------------------------------
+# CloudWatch Alarm: ECS Service Memory Utilization
+# ----------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "ecs_high_memory" {
+  alarm_name          = "${var.environment}-ecs-high-memory"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "MemoryUtilization"
+  namespace           = "AWS/ECS"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 85 # Alert if memory > 85%
+  alarm_description   = "ECS service memory usage is high - risk of OOM killer"
+
+  dimensions = {
+    ClusterName = aws_ecs_cluster.main.name
+    ServiceName = aws_ecs_service.app.name
+  }
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.environment}-ecs-memory-alarm"
+    Severity = "High"
+  }
+}
+
+# MEMORY EXHAUSTION: If task exceeds memory limit, ECS force-kills container
+# PREVENTION: Analyze memory leaks, increase ecs_task_memory, or fix code
+
+# ----------------------------------------------------------------------------
+# CloudWatch Alarm: RDS CPU Utilization
+# ----------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "rds_high_cpu" {
+  alarm_name          = "${var.environment}-rds-high-cpu"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 80
+  alarm_description   = "RDS CPU usage is high - consider query optimization or larger instance"
+
+  dimensions = {
+    DBInstanceIdentifier = aws_db_instance.main.id
+  }
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.environment}-rds-cpu-alarm"
+    Severity = "Medium"
+  }
+}
+
+# RDS HIGH CPU SOLUTIONS:
+# 1. Query optimization (add indexes, optimize slow queries)
+# 2. Read replicas (offload read traffic)
+# 3. Vertical scaling (larger instance class)
+# 4. Connection pooling (reduce connection overhead)
+
+# ----------------------------------------------------------------------------
+# CloudWatch Alarm: RDS Disk Space
+# ----------------------------------------------------------------------------
+resource "aws_cloudwatch_metric_alarm" "rds_low_storage" {
+  alarm_name          = "${var.environment}-rds-low-storage"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "FreeStorageSpace"
+  namespace           = "AWS/RDS"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 2000000000 # 2 GB in bytes
+  alarm_description   = "RDS free storage is low - enable storage autoscaling or increase allocated_storage"
+
+  dimensions = {
+    DBInstanceIdentifier = aws_db_instance.main.id
+  }
+
+  alarm_actions = [aws_sns_topic.alarms.arn]
+
+  tags = {
+    Name     = "${var.environment}-rds-storage-alarm"
+    Severity = "Critical"
+  }
+}
+
+# DISK FULL CONSEQUENCES:
+# - Database stops accepting writes
+# - Application errors
+# - Downtime until storage expanded
+# PREVENTION: Enable max_allocated_storage for auto-scaling
+
+# ----------------------------------------------------------------------------
+# CloudWatch Alarm: Lambda Errors
+# ----------------------------------------------------------------------------
+# NOTE: Uncomment when Lambda function is created
+# resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+#   alarm_name          = "${var.environment}-lambda-errors"
+#   comparison_operator = "GreaterThanThreshold"
+#   evaluation_periods  = 1
+#   metric_name         = "Errors"
+#   namespace           = "AWS/Lambda"
+#   period              = 60
+#   statistic           = "Sum"
+#   threshold           = 5
+#   alarm_description   = "Lambda function errors detected"
+#
+#   dimensions = {
+#     FunctionName = aws_lambda_function.processor.function_name
+#   }
+#
+#   alarm_actions = [aws_sns_topic.alarms.arn]
+# }
+
+# ============================================================================
+# ALARM STATE MACHINE:
+# ============================================================================
+# OK → ALARM:
+# - Threshold breached for 'evaluation_periods' consecutive periods
+# - Triggers alarm_actions (sends notification)
+#
+# ALARM → OK:
+# - Metric returns below threshold
+# - Triggers ok_actions (recovery notification)
+#
+# INSUFFICIENT_DATA:
+# - Not enough data points to evaluate
+# - Common during initial deployment or maintenance windows
+# ============================================================================
+
+# ============================================================================
+# COMPOSITE ALARMS (Advanced):
+# ============================================================================
+# Combine multiple alarms with AND/OR logic to reduce alert fatigue
+# resource "aws_cloudwatch_composite_alarm" "critical_app_health" {
+#   alarm_name = "${var.environment}-critical-app-health"
+#   alarm_description = "Application is unhealthy (multiple indicators)"
+#
+#   alarm_actions = [aws_sns_topic.alarms.arn]
+#
+#   alarm_rule = "ALARM(${aws_cloudwatch_metric_alarm.unhealthy_targets.alarm_name}) OR ALARM(${aws_cloudwatch_metric_alarm.alb_5xx_errors.alarm_name})"
+# }
+
+# ============================================================================
+# CUSTOM METRICS (Application-Level):
+# ============================================================================
+# Publish custom metrics from application code using CloudWatch PutMetric API:
+#
+# Python Example (boto3):
+# import boto3
+# cloudwatch = boto3.client('cloudwatch')
+# cloudwatch.put_metric_data(
+#     Namespace='CustomApp',
+#     MetricData=[{
+#         'MetricName': 'OrdersProcessed',
+#         'Value': 100,
+#         'Unit': 'Count',
+#         'Timestamp': datetime.now()
+#     }]
+# )
+#
+# Then create alarm on this custom metric for business KPIs
+# ============================================================================
+
+# ============================================================================
+# INTERVIEW TALKING POINTS:
+# ============================================================================
+# 1. METRIC STATISTICS:
+#    - Average: Mean value over period
+#    - Sum: Total (use for counts like HTTPRequests)
+#    - Maximum: Peak value (use for latency p100)
+#    - SampleCount: Number of data points
+#    - p99/p95: Percentile (requires percentile statistics)
+#
+# 2. ALARM TUNING:
+#    - Too sensitive → Alert fatigue → Ignored alarms
+#    - Too loose → Miss critical issues → User impact
+#    - Use evaluation_periods to filter transient spikes
+#
+# 3. TREAT_MISSING_DATA:
+#    - notBreaching: Assume healthy if no data (default)
+#    - breaching: Assume unhealthy if no data
+#    - ignore: Maintain previous state
+#    - missing: Transition to INSUFFICIENT_DATA state
+# ============================================================================
+
+# ============================================================================
+# PRODUCTION ENHANCEMENTS:
+# ============================================================================
+# 1. Anomaly Detection Alarms:
+#    - Use machine learning to detect unusual patterns
+#    - CloudWatch automatically learns baseline behavior
+#
+# 2. Metric Math:
+#    - Create alarms on derived metrics (e.g., error_rate = errors / requests)
+#
+# 3. Cross-Account Alarms:
+#    - Monitor dev/staging/prod from centralized monitoring account
+#
+# 4. Alarm Hierarchies:
+#    - High severity → PagerDuty (wake up on-call engineer)
+#    - Medium severity → Slack (business hours response)
+#    - Low severity → Email (review next day)
+# ============================================================================
+
+# OUTPUT: SNS topic ARN for manual subscriptions
+output "alarm_topic_arn" {
+  description = "SNS topic ARN for CloudWatch alarms"
+  value       = aws_sns_topic.alarms.arn
+}

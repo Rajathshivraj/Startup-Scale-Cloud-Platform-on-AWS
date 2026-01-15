@@ -1,0 +1,268 @@
+# ============================================================================
+# Amazon ECS (Elastic Container Service) - Container Orchestration
+# ============================================================================
+# ECS manages Docker containers at scale with automatic failover, health checks,
+# and integration with ALB for zero-downtime deployments.
+#
+# FARGATE vs EC2 LAUNCH TYPE:
+# - Fargate: Serverless, AWS manages infrastructure, pay per vCPU/memory
+# - EC2: You manage EC2 instances, more control, potentially cheaper at scale
+#
+# This configuration uses FARGATE for simplicity and operational excellence.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# ECS Cluster - Logical Grouping of Services
+# ----------------------------------------------------------------------------
+resource "aws_ecs_cluster" "main" {
+  name = "${var.environment}-startup-cluster"
+
+  # CONTAINER INSIGHTS: Enhanced monitoring for ECS (additional cost)
+  setting {
+    name  = "containerInsights"
+    value = "enabled" # Provides per-task CPU/memory metrics in CloudWatch
+  }
+
+  tags = {
+    Name = "${var.environment}-ecs-cluster"
+  }
+}
+
+# CLUSTER PURPOSE: Namespace for services, no direct cost (only tasks cost money)
+# Can run multiple services (frontend, backend, workers) in same cluster
+
+# ----------------------------------------------------------------------------
+# CloudWatch Log Group for ECS Tasks
+# ----------------------------------------------------------------------------
+resource "aws_cloudwatch_log_group" "ecs" {
+  name              = "/ecs/${var.environment}-startup-app"
+  retention_in_days = 7 # Retain logs for 7 days (increase to 30/90 for prod)
+
+  tags = {
+    Name = "${var.environment}-ecs-logs"
+  }
+}
+
+# LOG RETENTION STRATEGY:
+# - Dev: 7 days (cost optimization)
+# - Staging: 30 days (troubleshooting window)
+# - Prod: 90+ days (compliance requirements)
+
+# ----------------------------------------------------------------------------
+# ECS Task Definition - Blueprint for Running Containers
+# ----------------------------------------------------------------------------
+resource "aws_ecs_task_definition" "app" {
+  family                   = "${var.environment}-startup-app"
+  network_mode             = "awsvpc" # Required for Fargate (each task gets own ENI)
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = var.ecs_task_cpu    # 512 = 0.5 vCPU
+  memory                   = var.ecs_task_memory # 1024 = 1 GB RAM
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  task_role_arn            = aws_iam_role.ecs_task_role.arn
+
+  # CONTAINER DEFINITION (JSON format required by AWS)
+  container_definitions = jsonencode([
+    {
+      name      = "app"
+      image     = var.app_image # ECR image URI (e.g., account.dkr.ecr.region.amazonaws.com/repo:tag)
+      essential = true           # If this container stops, stop entire task
+
+      portMappings = [
+        {
+          containerPort = var.container_port # Must match Flask app.run(port=5000)
+          hostPort      = var.container_port # Same for awsvpc network mode
+          protocol      = "tcp"
+        }
+      ]
+
+      # ENVIRONMENT VARIABLES (passed to container)
+      environment = [
+        {
+          name  = "ENVIRONMENT"
+          value = var.environment
+        },
+        {
+          name  = "AWS_REGION"
+          value = var.aws_region
+        },
+        {
+          name  = "DYNAMODB_TABLE"
+          value = aws_dynamodb_table.main.name
+        },
+        {
+          name  = "DB_HOST"
+          value = aws_db_instance.main.endpoint
+        }
+        # PRODUCTION: Use secrets for sensitive values
+        # {
+        #   name      = "DB_PASSWORD"
+        #   valueFrom = aws_secretsmanager_secret.db_password.arn
+        # }
+      ]
+
+      # LOGGING CONFIGURATION
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs.name
+          "awslogs-region"        = var.aws_region
+          "awslogs-stream-prefix" = "ecs"
+        }
+      }
+
+      # HEALTH CHECK (Container-level, not ALB-level)
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -f http://localhost:${var.container_port}/health || exit 1"]
+        interval    = 30  # Check every 30 seconds
+        timeout     = 5   # Fail if no response in 5 seconds
+        retries     = 3   # 3 consecutive failures = unhealthy
+        startPeriod = 60  # Grace period for app startup (don't fail during boot)
+      }
+      # REQUIRES: curl installed in Docker image
+    }
+  ])
+
+  tags = {
+    Name = "${var.environment}-task-definition"
+  }
+}
+
+# TASK DEFINITION VERSIONING: Each change creates new revision (e.g., my-task:1, my-task:2)
+# ECS service can be configured to use :latest or specific revision
+
+# ----------------------------------------------------------------------------
+# ECS Service - Maintains Desired Number of Running Tasks
+# ----------------------------------------------------------------------------
+resource "aws_ecs_service" "app" {
+  name            = "${var.environment}-startup-service"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.app.arn
+  desired_count   = var.ecs_desired_count # Number of tasks to run
+  launch_type     = "FARGATE"
+
+  # NETWORK CONFIGURATION
+  network_configuration {
+    subnets          = aws_subnet.private[*].id # Deploy in private subnets
+    security_groups  = [aws_security_group.ecs_tasks.id]
+    assign_public_ip = false # No public IP (uses NAT Gateway for outbound)
+  }
+
+  # LOAD BALANCER INTEGRATION
+  load_balancer {
+    target_group_arn = aws_lb_target_group.app.arn
+    container_name   = "app" # Must match name in container_definitions
+    container_port   = var.container_port
+  }
+
+  # DEPLOYMENT CONFIGURATION
+  deployment_configuration {
+    maximum_percent         = 200 # Can temporarily run 2x desired_count during deployment
+    minimum_healthy_percent = 100 # Must maintain at least 100% capacity (zero downtime)
+  }
+
+  # IMPORTANT: Prevent Terraform from reverting CI/CD deployments
+  lifecycle {
+    ignore_changes = [task_definition]
+    # EXPLANATION: GitHub Actions will update task_definition with new image tags.
+    # Without this, terraform apply would revert to the definition in code.
+  }
+
+  # DEPENDENCY: Wait for ALB listener to exist before creating service
+  depends_on = [aws_lb_listener.http]
+
+  tags = {
+    Name = "${var.environment}-ecs-service"
+  }
+}
+
+# DEPLOYMENT BEHAVIOR:
+# - New task started (becomes "running" after health checks pass)
+# - ALB begins routing traffic to new task
+# - Old task receives "stop" signal (SIGTERM)
+# - Deregistration delay: 30 seconds for graceful shutdown
+# - Old task forcibly stopped after timeout
+
+# ----------------------------------------------------------------------------
+# Auto Scaling for ECS Service (CPU-based)
+# ----------------------------------------------------------------------------
+resource "aws_appautoscaling_target" "ecs" {
+  max_capacity       = 10 # Maximum tasks to scale to
+  min_capacity       = var.ecs_desired_count
+  resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.app.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "ecs_cpu" {
+  name               = "${var.environment}-cpu-autoscaling"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+    target_value       = 70.0 # Scale when average CPU > 70%
+    scale_in_cooldown  = 300  # Wait 5 min before scaling down
+    scale_out_cooldown = 60   # Wait 1 min before scaling up again
+  }
+}
+
+# AUTO SCALING LOGIC:
+# - CPU > 70% → Add 1 task (up to max_capacity=10)
+# - CPU < 70% → Remove 1 task (down to min_capacity=2)
+# - Cooldown prevents thrashing (rapid scale up/down cycles)
+
+# ADVANCED: Memory-based scaling
+# resource "aws_appautoscaling_policy" "ecs_memory" {
+#   # Similar structure, use ECSServiceAverageMemoryUtilization
+# }
+
+# ============================================================================
+# ECS TASK LIFECYCLE (Interview Explanation):
+# ============================================================================
+# 1. PENDING: Task scheduled, waiting for resources
+# 2. PULLING: Downloading Docker image from ECR
+# 3. RUNNING: Container started, health checks in progress
+# 4. HEALTHY: Health checks passing, ALB routes traffic
+# 5. DRAINING: Received stop signal, connection draining active
+# 6. STOPPED: Task terminated, resources released
+# ============================================================================
+
+# ============================================================================
+# TROUBLESHOOTING TIPS:
+# ============================================================================
+# Common Issues:
+# 1. Task fails to start → Check execution role permissions (ECR access)
+# 2. Task starts but immediately stops → Check logs in CloudWatch
+# 3. Health checks failing → Verify /health endpoint returns 200 OK
+# 4. Cannot pull image → Check ECR repository permissions
+# 5. High CPU/Memory → Scale up task resources or desired_count
+# ============================================================================
+
+# ============================================================================
+# COST BREAKDOWN (us-east-1 pricing):
+# ============================================================================
+# Fargate Pricing:
+# - 0.5 vCPU + 1 GB = $0.02852/hour = ~$20/month per task
+# - 2 tasks (desired_count=2) = ~$40/month
+# - Auto-scaling to 10 tasks at peak = ~$200/month maximum
+#
+# Cost Optimization:
+# 1. Use Fargate Spot (70% discount, interruptible)
+# 2. Right-size CPU/memory (don't over-provision)
+# 3. Scale down during off-hours (scheduled scaling)
+# ============================================================================
+
+# OUTPUT: Service name for reference in CI/CD
+output "ecs_cluster_name" {
+  description = "Name of ECS cluster"
+  value       = aws_ecs_cluster.main.name
+}
+
+output "ecs_service_name" {
+  description = "Name of ECS service"
+  value       = aws_ecs_service.app.name
+}

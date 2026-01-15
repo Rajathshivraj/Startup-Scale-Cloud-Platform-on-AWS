@@ -1,0 +1,66 @@
+# ============================================================================
+# AWS Provider Configuration
+# ============================================================================
+# This file establishes the connection between Terraform and AWS, defining
+# which region to deploy resources into and how to authenticate.
+#
+# DESIGN DECISIONS:
+# - Using us-east-1 (N. Virginia) for lowest latency to most AWS services
+# - Required providers block ensures version compatibility across teams
+# - Remote state via S3 backend enables team collaboration (commented for demo)
+# ============================================================================
+
+terraform {
+  # Specify minimum Terraform version to ensure feature compatibility
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0" # Use 5.x versions, auto-update minor/patch versions
+    }
+  }
+
+  # PRODUCTION CONSIDERATION: Enable remote state for team collaboration
+  # backend "s3" {
+  #   bucket         = "startup-platform-terraform-state"
+  #   key            = "prod/terraform.tfstate"
+  #   region         = "us-east-1"
+  #   dynamodb_table = "terraform-state-lock" # Prevents concurrent modifications
+  #   encrypt        = true                   # Encryption at rest
+  # }
+}
+
+# Configure the AWS Provider
+provider "aws" {
+  region = var.aws_region
+
+  # Default tags applied to ALL resources for cost tracking and governance
+  default_tags {
+    tags = {
+      Project     = "StartupPlatform"
+      Environment = var.environment
+      ManagedBy   = "Terraform"
+      CostCenter  = "Engineering"
+      # COMPLIANCE NOTE: These tags enable AWS Cost Explorer filtering
+      # and support FinOps practices for budget accountability
+    }
+  }
+}
+
+# ============================================================================
+# IMPORTANT NOTES FOR INTERVIEWS:
+# ============================================================================
+# Q: Why version pinning with ~> 5.0?
+# A: Allows automatic patch updates (5.0.1 → 5.0.2) but prevents breaking
+#    changes from major version upgrades (5.x → 6.x)
+#
+# Q: Why default tags?
+# A: Ensures consistent resource tagging across 1000+ resources without
+#    manual intervention. Critical for cost allocation and compliance audits.
+#
+# Q: Why S3 backend for state?
+# A: Local state files don't support team collaboration and risk data loss.
+#    S3 + DynamoDB locking prevents "split-brain" scenarios where two
+#    engineers simultaneously modify infrastructure.
+# ============================================================================

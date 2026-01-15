@@ -1,0 +1,212 @@
+# ============================================================================
+# VPC and Networking Infrastructure
+# ============================================================================
+# This file creates the foundational network layer following AWS best practices:
+# - Public subnets for internet-facing resources (ALB)
+# - Private subnets for compute/data layers (ECS, RDS)
+# - Multi-AZ deployment for high availability
+# - NAT Gateway for secure outbound internet access from private subnets
+#
+# SECURITY MODEL: Defense in depth with network segmentation
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# VPC - Virtual Private Cloud
+# ----------------------------------------------------------------------------
+resource "aws_vpc" "main" {
+  cidr_block = var.vpc_cidr
+
+  # REQUIRED for ECS: Tasks need DNS resolution to reach AWS services
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "${var.environment}-startup-vpc"
+  }
+}
+
+# WHY VPC: Logically isolated network where you control IP addressing,
+# routing, and network gateways. Essential for security compliance (PCI-DSS, HIPAA)
+
+# ----------------------------------------------------------------------------
+# Internet Gateway - Enables Internet Connectivity
+# ----------------------------------------------------------------------------
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "${var.environment}-igw"
+  }
+}
+
+# PURPOSE: Allows resources in PUBLIC subnets to communicate with the internet.
+# Bidirectional: Outbound requests AND inbound responses (e.g., ALB receiving traffic)
+
+# ----------------------------------------------------------------------------
+# Public Subnets - For Internet-Facing Resources
+# ----------------------------------------------------------------------------
+resource "aws_subnet" "public" {
+  count = length(var.availability_zones)
+
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = var.availability_zones[count.index]
+  map_public_ip_on_launch = true # Auto-assign public IPs to resources
+
+  tags = {
+    Name = "${var.environment}-public-subnet-${count.index + 1}"
+    Type = "Public"
+    # KUBERNETES COMPATIBILITY: Add tags if migrating to EKS later
+    # "kubernetes.io/role/elb" = "1"
+  }
+}
+
+# MULTI-AZ DESIGN: Each subnet in different AZ protects against datacenter failures.
+# If us-east-1a fails, us-east-1b continues serving traffic.
+
+# ----------------------------------------------------------------------------
+# Private Subnets - For Internal Resources (No Direct Internet Access)
+# ----------------------------------------------------------------------------
+resource "aws_subnet" "private" {
+  count = length(var.availability_zones)
+
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = var.availability_zones[count.index]
+
+  tags = {
+    Name = "${var.environment}-private-subnet-${count.index + 1}"
+    Type = "Private"
+  }
+}
+
+# SECURITY PRINCIPLE: ECS tasks and databases never get public IPs.
+# Attack surface reduced to ONLY the load balancer.
+
+# ----------------------------------------------------------------------------
+# Elastic IP for NAT Gateway
+# ----------------------------------------------------------------------------
+resource "aws_eip" "nat" {
+  count  = length(var.availability_zones)
+  domain = "vpc" # Modern syntax (replaces deprecated "vpc = true")
+
+  tags = {
+    Name = "${var.environment}-nat-eip-${count.index + 1}"
+  }
+
+  # Dependency ensures IGW exists before EIP is created
+  depends_on = [aws_internet_gateway.main]
+}
+
+# WHY ELASTIC IP: Static IP address that persists even if NAT Gateway is replaced.
+# Useful for whitelisting your infrastructure in third-party services.
+
+# ----------------------------------------------------------------------------
+# NAT Gateway - Outbound Internet for Private Subnets
+# ----------------------------------------------------------------------------
+resource "aws_nat_gateway" "main" {
+  count = length(var.availability_zones)
+
+  allocation_id = aws_eip.nat[count.index].id
+  subnet_id     = aws_subnet.public[count.index].id
+
+  tags = {
+    Name = "${var.environment}-nat-gateway-${count.index + 1}"
+  }
+}
+
+# NAT GATEWAY PURPOSE: Allows ECS tasks in PRIVATE subnets to:
+# - Pull Docker images from ECR
+# - Make API calls to AWS services (if VPC endpoints not used)
+# - Download software updates
+# BUT: Blocks ALL inbound traffic from internet (unidirectional)
+
+# COST CONSIDERATION: $0.045/hour per NAT Gateway ($32/month)
+# Production optimization: Use VPC endpoints for AWS services to reduce NAT costs
+
+# ----------------------------------------------------------------------------
+# Route Table for Public Subnets
+# ----------------------------------------------------------------------------
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0" # All traffic
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "${var.environment}-public-rt"
+  }
+}
+
+# ROUTING LOGIC: "Send all traffic destined for the internet (0.0.0.0/0) through IGW"
+
+# ----------------------------------------------------------------------------
+# Associate Public Subnets with Public Route Table
+# ----------------------------------------------------------------------------
+resource "aws_route_table_association" "public" {
+  count = length(var.availability_zones)
+
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+# ----------------------------------------------------------------------------
+# Route Tables for Private Subnets (One per AZ)
+# ----------------------------------------------------------------------------
+resource "aws_route_table" "private" {
+  count = length(var.availability_zones)
+
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main[count.index].id
+  }
+
+  tags = {
+    Name = "${var.environment}-private-rt-${count.index + 1}"
+  }
+}
+
+# ROUTING LOGIC: "Send all outbound traffic through NAT Gateway in the SAME AZ"
+# AZ-specific routing prevents cross-AZ data transfer charges
+
+# ----------------------------------------------------------------------------
+# Associate Private Subnets with Private Route Tables
+# ----------------------------------------------------------------------------
+resource "aws_route_table_association" "private" {
+  count = length(var.availability_zones)
+
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private[count.index].id
+}
+
+# ============================================================================
+# NETWORK FLOW DIAGRAM (For Interviews):
+# ============================================================================
+#
+# INBOUND (User Request):
+# Internet → IGW → ALB (public subnet) → ECS Task (private subnet)
+#
+# OUTBOUND (ECS Task Making API Call):
+# ECS Task (private subnet) → NAT Gateway (public subnet) → IGW → Internet
+#
+# INTERNAL (ECS to RDS):
+# ECS Task (private subnet AZ-a) → RDS (private subnet AZ-a) - stays within VPC
+#
+# ============================================================================
+
+# ============================================================================
+# COST OPTIMIZATION IDEAS (For Senior Interviews):
+# ============================================================================
+# 1. VPC Endpoints: Replace NAT Gateway for AWS service access (S3, DynamoDB)
+#    - Saves $30-50/month in NAT charges for high-traffic applications
+#
+# 2. Single NAT Gateway: Use one NAT across all AZs (reduces HA)
+#    - Appropriate for dev/staging, NOT for production
+#
+# 3. IPv6: Use Egress-Only Internet Gateway (free alternative to NAT)
+#    - Requires application IPv6 support
+# ============================================================================

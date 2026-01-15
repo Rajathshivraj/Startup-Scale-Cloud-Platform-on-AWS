@@ -1,0 +1,270 @@
+# ============================================================================
+# Amazon RDS (Relational Database Service) - PostgreSQL
+# ============================================================================
+# Managed relational database with automated backups, patching, and Multi-AZ
+# high availability. This configuration uses PostgreSQL for ACID compliance
+# and complex query capabilities.
+#
+# DATABASE CHOICE RATIONALE:
+# - PostgreSQL: Advanced features, JSON support, strong consistency
+# - MySQL: Simpler, wider ecosystem, better for read-heavy workloads
+# - Aurora: AWS-native, 5x performance, but higher cost
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# DB Subnet Group - Defines Where RDS Can Be Deployed
+# ----------------------------------------------------------------------------
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.environment}-db-subnet-group"
+  subnet_ids = aws_subnet.private[*].id # Must be in at least 2 AZs
+
+  tags = {
+    Name = "${var.environment}-db-subnet-group"
+  }
+}
+
+# REQUIREMENT: RDS needs subnets in at least 2 AZs for Multi-AZ deployments
+# Even single-AZ deployments require subnet group with 2+ subnets
+
+# ----------------------------------------------------------------------------
+# Security Group for RDS - Database Access Control
+# ----------------------------------------------------------------------------
+resource "aws_security_group" "rds" {
+  name        = "${var.environment}-rds-sg"
+  description = "Security group for RDS PostgreSQL"
+  vpc_id      = aws_vpc.main.id
+
+  # INBOUND RULE: Allow PostgreSQL traffic ONLY from ECS tasks
+  ingress {
+    description     = "Allow PostgreSQL from ECS tasks"
+    from_port       = 5432 # PostgreSQL default port
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ecs_tasks.id] # Source is ECS SG
+  }
+
+  # OUTBOUND RULE: RDS typically doesn't need outbound (but allow for extensions)
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.environment}-rds-sg"
+  }
+}
+
+# SECURITY MODEL: Only ECS tasks can connect to database
+# No direct internet access, no SSH access, no management console access
+
+# ----------------------------------------------------------------------------
+# RDS Parameter Group - Database Engine Configuration
+# ----------------------------------------------------------------------------
+resource "aws_db_parameter_group" "main" {
+  name   = "${var.environment}-postgres-params"
+  family = "postgres15" # Must match engine version (postgres15 for 15.x)
+
+  # EXAMPLE PARAMETERS (customize based on workload)
+  parameter {
+    name  = "log_connections"
+    value = "1" # Log all connection attempts (security audit)
+  }
+
+  parameter {
+    name  = "log_disconnections"
+    value = "1"
+  }
+
+  parameter {
+    name  = "log_statement"
+    value = "all" # Log all SQL statements (change to "ddl" in prod for performance)
+  }
+
+  tags = {
+    Name = "${var.environment}-db-params"
+  }
+}
+
+# PARAMETER TUNING (Production Considerations):
+# - shared_buffers: 25% of instance memory
+# - max_connections: Based on expected concurrent users
+# - work_mem: Memory per query operation
+# - effective_cache_size: Guide query planner (75% of instance memory)
+
+# ----------------------------------------------------------------------------
+# RDS Instance - PostgreSQL Database
+# ----------------------------------------------------------------------------
+resource "aws_db_instance" "main" {
+  identifier = "${var.environment}-startup-db"
+
+  # ENGINE CONFIGURATION
+  engine               = "postgres"
+  engine_version       = "15.3" # Specify minor version to prevent auto-upgrades
+  instance_class       = var.db_instance_class
+  allocated_storage    = var.db_allocated_storage
+  storage_type         = "gp3" # General Purpose SSD v3 (latest, better performance than gp2)
+  storage_encrypted    = true  # Encryption at rest using AWS KMS
+  max_allocated_storage = 100  # Enable storage autoscaling (up to 100 GB)
+
+  # DATABASE CREDENTIALS
+  db_name  = var.db_name
+  username = var.db_username
+  password = "CHANGEME_USE_SECRETS_MANAGER" # NEVER hardcode in production
+  # PRODUCTION: Use random_password resource + AWS Secrets Manager
+  # password = random_password.db_password.result
+
+  # NETWORKING
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  publicly_accessible    = false # CRITICAL: Never expose RDS to internet
+
+  # AVAILABILITY & BACKUP
+  multi_az               = false # Set true for production (automatic failover)
+  backup_retention_period = 7     # Keep automated backups for 7 days
+  backup_window          = "03:00-04:00" # UTC time window (off-peak hours)
+  maintenance_window     = "sun:04:00-sun:05:00"
+  skip_final_snapshot    = true # Set false in production (keeps snapshot on destroy)
+  final_snapshot_identifier = "${var.environment}-db-final-snapshot"
+
+  # MONITORING
+  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"] # Send logs to CloudWatch
+  monitoring_interval             = 60                        # Enhanced monitoring every 60 seconds
+  monitoring_role_arn             = aws_iam_role.rds_monitoring.arn
+  performance_insights_enabled    = false # Set true for query performance analysis (additional cost)
+
+  # CONFIGURATION
+  parameter_group_name = aws_db_parameter_group.main.name
+  apply_immediately    = false # Changes applied during maintenance window
+
+  # DELETION PROTECTION (Production Safeguard)
+  deletion_protection = false # Set true for production
+
+  tags = {
+    Name = "${var.environment}-rds-instance"
+  }
+}
+
+# MULTI-AZ EXPLAINED:
+# - Primary instance in AZ-A, synchronous replication to standby in AZ-B
+# - Automatic failover in 1-2 minutes if primary fails
+# - No application code changes needed (same endpoint)
+# - 2x cost (two instances running)
+
+# ----------------------------------------------------------------------------
+# IAM Role for RDS Enhanced Monitoring
+# ----------------------------------------------------------------------------
+resource "aws_iam_role" "rds_monitoring" {
+  name = "${var.environment}-rds-monitoring-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "monitoring.rds.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "rds_monitoring" {
+  role       = aws_iam_role.rds_monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
+
+# ENHANCED MONITORING: OS-level metrics (CPU, memory, disk I/O) at 1-60 second intervals
+# Standard CloudWatch metrics are 1-minute minimum
+
+# ============================================================================
+# RDS BACKUP STRATEGY (Interview Talking Point):
+# ============================================================================
+# 1. AUTOMATED BACKUPS:
+#    - Full daily snapshot during backup_window
+#    - Transaction logs backed up every 5 minutes
+#    - Point-in-time recovery (restore to any second within retention period)
+#
+# 2. MANUAL SNAPSHOTS:
+#    - Created on-demand (e.g., before major schema changes)
+#    - Retained indefinitely (user must delete)
+#    - Can be copied to other regions for disaster recovery
+#
+# 3. SNAPSHOT SHARING:
+#    - Share encrypted snapshots with other AWS accounts (for dev/staging clones)
+# ============================================================================
+
+# ============================================================================
+# CONNECTION STRING FORMAT:
+# ============================================================================
+# postgresql://username:password@endpoint:5432/database
+# Example: postgresql://dbadmin:pass123@dev-startup-db.abc123.us-east-1.rds.amazonaws.com:5432/startupdb
+#
+# APPLICATION CODE (Python):
+# import psycopg2
+# conn = psycopg2.connect(
+#     host=os.environ['DB_HOST'],
+#     database=os.environ['DB_NAME'],
+#     user=os.environ['DB_USERNAME'],
+#     password=os.environ['DB_PASSWORD']
+# )
+# ============================================================================
+
+# ============================================================================
+# PRODUCTION ENHANCEMENTS:
+# ============================================================================
+# 1. Secrets Management:
+#    resource "random_password" "db_password" {
+#      length  = 32
+#      special = true
+#    }
+#    resource "aws_secretsmanager_secret" "db_password" {
+#      name = "${var.environment}/rds/password"
+#    }
+#    resource "aws_secretsmanager_secret_version" "db_password" {
+#      secret_id     = aws_secretsmanager_secret.db_password.id
+#      secret_string = random_password.db_password.result
+#    }
+#
+# 2. Read Replicas (for read-heavy workloads):
+#    resource "aws_db_instance" "read_replica" {
+#      replicate_source_db = aws_db_instance.main.id
+#      instance_class      = "db.t3.small"
+#    }
+#
+# 3. Cross-Region Replicas (disaster recovery):
+#    Use AWS DMS or logical replication
+# ============================================================================
+
+# ============================================================================
+# COST BREAKDOWN (us-east-1):
+# ============================================================================
+# db.t3.micro (1 vCPU, 1 GB RAM):
+# - Single-AZ: $0.018/hour = ~$13/month
+# - Multi-AZ: $0.036/hour = ~$26/month
+#
+# Storage (gp3):
+# - $0.115/GB-month (20 GB = $2.30/month)
+#
+# Backups:
+# - Free up to 100% of allocated storage
+# - Additional backups: $0.095/GB-month
+#
+# Total Dev Cost: ~$15/month (single-AZ, 20 GB)
+# Total Prod Cost: ~$30+/month (multi-AZ, larger instance)
+# ============================================================================
+
+# OUTPUT: Connection information for application
+output "rds_endpoint" {
+  description = "RDS instance endpoint (hostname:port)"
+  value       = aws_db_instance.main.endpoint
+}
+
+output "rds_database_name" {
+  description = "Database name"
+  value       = aws_db_instance.main.db_name
+}
